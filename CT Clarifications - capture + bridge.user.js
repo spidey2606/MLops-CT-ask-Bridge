@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CT Clarifications - capture + bridge
 // @namespace    ct-clarifications
-// @version      0.4.7
+// @version      0.4.8
 // @homepageURL  https://ct-ask.beta.harmony.a2z.com/
 // @updateURL    https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
 // @downloadURL  https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
@@ -12,6 +12,7 @@
 // @noframes
 // @sandbox      JavaScript
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -26,7 +27,7 @@
 
   // ---------- config ----------
   const CONTRACT_VERSION = '0.2.0';
-  const SCRIPT_VERSION = '0.4.7';
+  const SCRIPT_VERSION = '0.4.8';
   // Where the Clarify button opens the site. Harmony beta is the live site for now; switch to
   // https://ct-ask.harmony.a2z.com/ only if prod is ever deployed.
   const CT_SITE_URL = 'https://ct-ask.beta.harmony.a2z.com/';
@@ -404,18 +405,33 @@
   // Dark pill: the word "Clarify" followed by a small orange speech-bubble icon. No hover motion.
   // Single click = capture + open the site. Drag the pill to move it (position is remembered).
   const POS_KEY = 'ctc_btn_pos';
-  const CLARIFY_CSS = `
-#ctc-clarify{position:fixed;right:32px;bottom:32px;z-index:99999}
-#ctc-clarify .ctc-pill{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;gap:9px;height:44px;padding:0 18px 0 22px;border-radius:999px;background:#0f1115;color:#fff;font-family:"Amazon Ember",system-ui,"Segoe UI",sans-serif;font-weight:700;font-size:16px;line-height:1;letter-spacing:.2px;white-space:nowrap;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.25);user-select:none;-webkit-user-select:none;touch-action:none}
-#ctc-clarify .ctc-pill svg{width:19px;height:19px;flex:none;color:#ff9900}
-#ctc-clarify .ctc-pill:focus-visible{outline:2px solid #ff9900;outline-offset:3px}
-#ctc-clarify.ctc-dragging .ctc-pill{cursor:grabbing}
-`;
+  // The pill's look lives here (and only here), set straight on the elements with !important. abc-mlops has a
+  // Content Security Policy (style-src 'self' + nonce) that can block a <style> sheet from a userscript; styles
+  // set from script are not blocked, and !important keeps the page's own CSS from overriding them.
+  const PILL_WRAP_STYLE = { position: 'fixed', right: '32px', bottom: '32px', 'z-index': '99999' };
+  const PILL_STYLE = {
+    'box-sizing': 'border-box', display: 'inline-flex', 'align-items': 'center', gap: '9px', height: '44px',
+    width: 'auto', margin: '0', padding: '0 18px 0 22px', border: '0', 'border-radius': '999px',
+    background: '#0f1115', color: '#fff', 'font-family': '"Amazon Ember",system-ui,"Segoe UI",sans-serif',
+    'font-weight': '700', 'font-size': '16px', 'line-height': '1', 'letter-spacing': '.2px',
+    'text-transform': 'none', 'white-space': 'nowrap', cursor: 'pointer', outline: 'none',
+    'box-shadow': '0 6px 18px rgba(0,0,0,.25)', 'user-select': 'none', '-webkit-user-select': 'none',
+    'touch-action': 'none',
+  };
+  const ICON_STYLE = { width: '19px', height: '19px', flex: 'none', color: '#ff9900' };
+  const setStyle = (el, props) => { for (const k in props) el.style.setProperty(k, props[k], 'important'); };
+  // Optional extra: the keyboard focus ring (a style can't target :focus-visible directly). If the sheet is
+  // blocked, only the ring is lost.
+  const FOCUS_CSS = '#ctc-clarify .ctc-pill:focus-visible{outline:2px solid #ff9900 !important;outline-offset:3px !important}';
+  function addSheet(css) {
+    try { if (typeof GM_addStyle === 'function') { GM_addStyle(css); return; } } catch (e) { /* fall back */ }
+    const st = document.createElement('style');
+    st.textContent = css;
+    document.head.appendChild(st);
+  }
 
   function startCapture() {
-    const st = document.createElement('style');
-    st.textContent = CLARIFY_CSS;
-    document.head.appendChild(st);
+    addSheet(FOCUS_CSS);
 
     const w = document.createElement('div');
     w.id = 'ctc-clarify';
@@ -425,14 +441,19 @@
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
       '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>' +
       '</button>';
+    setStyle(w, PILL_WRAP_STYLE);
     document.body.appendChild(w);
     const orb = w.querySelector('.ctc-pill');
+    setStyle(orb, PILL_STYLE);
+    setStyle(orb.querySelector('svg'), ICON_STYLE);
 
     // Remembered position (right/bottom offsets), clamped to the viewport.
     function place(pos) {
       const max = (v, lim, size) => Math.max(8, Math.min(v, lim - (size || 56) - 8));
-      w.style.right = max(pos.right, window.innerWidth, w.offsetWidth) + 'px';
-      w.style.bottom = max(pos.bottom, window.innerHeight, w.offsetHeight) + 'px';
+      setStyle(w, {
+        right: max(pos.right, window.innerWidth, w.offsetWidth) + 'px',
+        bottom: max(pos.bottom, window.innerHeight, w.offsetHeight) + 'px',
+      });
     }
     const saved = GM_getValue(POS_KEY, null);
     if (saved && typeof saved.right === 'number' && typeof saved.bottom === 'number') place(saved);
@@ -457,6 +478,7 @@
       if (!drag.moved && Math.hypot(dx, dy) < 5) return;
       drag.moved = true;
       w.classList.add('ctc-dragging');
+      setStyle(orb, { cursor: 'grabbing' });
       place({ right: drag.right - dx, bottom: drag.bottom - dy });
     });
     function endDrag() {
@@ -466,6 +488,7 @@
         GM_setValue(POS_KEY, { right: parseFloat(w.style.right), bottom: parseFloat(w.style.bottom) });
       }
       w.classList.remove('ctc-dragging');
+      setStyle(orb, { cursor: 'pointer' });
       drag = null;
     }
     orb.addEventListener('pointerup', endDrag);
