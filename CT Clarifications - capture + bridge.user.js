@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CT Clarifications - capture + bridge
 // @namespace    ct-clarifications
-// @version      0.5.0
+// @version      0.5.1
 // @homepageURL  https://ct-ask.beta.harmony.a2z.com/
 // @updateURL    https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
 // @downloadURL  https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
@@ -27,7 +27,7 @@
 
   // ---------- config ----------
   const CONTRACT_VERSION = '0.3.0';
-  const SCRIPT_VERSION = '0.5.0';
+  const SCRIPT_VERSION = '0.5.1';
   // Where the Clarify button opens the site. Harmony beta is the live site for now; switch to
   // https://ct-ask.harmony.a2z.com/ only if prod is ever deployed.
   const CT_SITE_URL = 'https://ct-ask.beta.harmony.a2z.com/';
@@ -41,7 +41,8 @@
   // Admin tab (0.5.0): create/update on CT-Roles and CT-Settings too. SharePoint itself keeps these two lists
   // read-only for Members, so only site owners (Admins) can actually write them; the bridge also limits the columns.
   const ADMIN_LISTS = ['CT-Roles', 'CT-Settings'];
-  const ROLE_COLUMNS = ['Title', 'PersonName', 'Role', 'SlackMemberId', 'Active'];
+  // 0.5.1: Marketplaces (text, e.g. "DE;FR;IT") = the MPs an auditor/SME answers for; empty = all.
+  const ROLE_COLUMNS = ['Title', 'PersonName', 'Role', 'SlackMemberId', 'Active', 'Marketplaces'];
   // The only CT-Settings rows the page may read. Webhook rows are returned as Id + Title only (so the Admin
   // Settings tab can replace them); their values stay inside the script. Unknown rows are never returned.
   const PUBLIC_SETTINGS = ['SlackChannel', 'AnyAuditorLabel', 'AppVersionMin', 'ReopenWindowHours',
