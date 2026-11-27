@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         CT Clarifications - capture + bridge
 // @namespace    ct-clarifications
-// @version      0.4.8
+// @version      0.5.0
 // @homepageURL  https://ct-ask.beta.harmony.a2z.com/
 // @updateURL    https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
 // @downloadURL  https://ct-ask.beta.harmony.a2z.com/ct-bridge.user.js
-// @description  On abc-mlops: the floating "Clarify" button captures the conversation and opens the CT Clarifications site. On the site: the SharePoint/Slack bridge (contract 0.2.0).
+// @description  On abc-mlops: the floating "Clarify" button captures the conversation and opens the CT Clarifications site. On the site: the SharePoint/Slack bridge (contract 0.3.0). Also sends any-auditor reminders from abc-mlops.
 // @match        https://abc-mlops.harmony.a2z.com/*
 // @match        https://ct-ask.beta.harmony.a2z.com/*
 // @match        https://ct-ask.harmony.a2z.com/*
@@ -26,8 +26,8 @@
   'use strict';
 
   // ---------- config ----------
-  const CONTRACT_VERSION = '0.2.0';
-  const SCRIPT_VERSION = '0.4.8';
+  const CONTRACT_VERSION = '0.3.0';
+  const SCRIPT_VERSION = '0.5.0';
   // Where the Clarify button opens the site. Harmony beta is the live site for now; switch to
   // https://ct-ask.harmony.a2z.com/ only if prod is ever deployed.
   const CT_SITE_URL = 'https://ct-ask.beta.harmony.a2z.com/';
@@ -36,9 +36,20 @@
   const SP = 'https://amazon.sharepoint.com/sites/CTClarifications';
   const API = SP + '/_api';
   const READ_LISTS = ['CT-Open', 'CT-Questions', 'CT-Roles', 'CT-Settings'];
+  // Doubt lists: create, update, delete, recycle.
   const WRITE_LISTS = ['CT-Open', 'CT-Questions'];
-  // The only CT-Settings rows the page may read. Everything else (e.g. SlackWebhookUrl) stays inside the script.
-  const PUBLIC_SETTINGS = ['SlackChannel', 'AnyAuditorLabel', 'AppVersionMin'];
+  // Admin tab (0.5.0): create/update on CT-Roles and CT-Settings too. SharePoint itself keeps these two lists
+  // read-only for Members, so only site owners (Admins) can actually write them; the bridge also limits the columns.
+  const ADMIN_LISTS = ['CT-Roles', 'CT-Settings'];
+  const ROLE_COLUMNS = ['Title', 'PersonName', 'Role', 'SlackMemberId', 'Active'];
+  // The only CT-Settings rows the page may read. Webhook rows are returned as Id + Title only (so the Admin
+  // Settings tab can replace them); their values stay inside the script. Unknown rows are never returned.
+  const PUBLIC_SETTINGS = ['SlackChannel', 'AnyAuditorLabel', 'AppVersionMin', 'ReopenWindowHours',
+    'ReminderIntervalMin', 'ReminderMaxCount', 'RejectReasons', 'FieldValueRules'];
+  // Which webhook each Slack message goes to (0.5.0). 'dm' = the direct-message workflow.
+  const HOOK_KEYS = { dm: 'SlackWebhookUrl', any: 'SlackChannelAnyWebhookUrl', accepted: 'SlackChannelAcceptedWebhookUrl' };
+  const SECRET_SETTINGS = Object.values(HOOK_KEYS);
+  const SLACK_FIELDS = { dm: ['asker', 'recipient', 'headline', 'details', 'link'], any: ['asker', 'message', 'link'], accepted: ['auditor', 'asker', 'link'] };
   const DRAFT_PREFIX = 'ctc_draft:';
   const CT_TAB_NAME = 'ct-clarifications';
   const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -67,6 +78,8 @@
     });
   }
   const NOMETA = { Accept: 'application/json;odata=nometadata' };
+  // Reads that need each item's ETag (0.5.0): minimal metadata adds "odata.etag" per item.
+  const MINMETA = { Accept: 'application/json;odata=minimalmetadata' };
   const parse = (r) => (r.responseText ? JSON.parse(r.responseText) : {});
   const L = (t) => "/web/lists/getbytitle('" + t + "')";
 
@@ -115,43 +128,104 @@
     return { alias };
   }
 
+  // Item as the page sees it: SharePoint's odata.* keys dropped, the ETag kept as __etag (0.5.0).
+  function cleanItem(it) {
+    const out = {};
+    for (const k of Object.keys(it)) if (!k.startsWith('odata.')) out[k] = it[k];
+    if (typeof it['odata.etag'] === 'string' && it['odata.etag']) out.__etag = it['odata.etag'];
+    return out;
+  }
+  // GET every page of a list query (no 5000 cap since 0.5.0; `want` stops early when the page asked for `top`).
+  async function getItems(list, qs, want) {
+    let url = API + L(list) + '/items' + (qs.length ? '?' + qs.join('&') : '');
+    let items = [];
+    for (let page = 0; url && items.length < want && page < 500; page++) {
+      const body = parse(await req('GET', url, { headers: MINMETA }));
+      items = items.concat(body.value || []);
+      url = body['odata.nextLink'] || null;
+    }
+    return items.slice(0, want).map(cleanItem);
+  }
+  // Titles named by a filter like "Title eq 'A' or Title eq 'B'" (any other filter text is ignored).
+  function filterTitles(filter) {
+    const out = [];
+    const re = /Title eq '((?:[^']|'')*)'/g;
+    let m;
+    while ((m = re.exec(String(filter)))) out.push(m[1].replace(/''/g, "'"));
+    return out;
+  }
+  // CT-Settings: the page's select/filter/order are never sent to SharePoint (a crafted filter could probe a
+  // webhook value). Read everything here, then keep the rows the filter names by Title.
+  async function settingsQuery(a) {
+    const rows = await getItems('CT-Settings', ['$select=Id,Title,SettingValue', '$top=5000'], Infinity);
+    const titles = a.filter ? filterTitles(a.filter) : null;
+    const out = [];
+    for (const r of rows) {
+      const t = String(r.Title || '');
+      if (titles && !titles.includes(t)) continue;
+      if (PUBLIC_SETTINGS.includes(t)) out.push({ Id: r.Id, Title: t, SettingValue: r.SettingValue, __etag: r.__etag });
+      else if (SECRET_SETTINGS.includes(t)) out.push({ Id: r.Id, Title: t, __etag: r.__etag });
+    }
+    return out;
+  }
   async function opSpQuery(a) {
     checkList(a.list, READ_LISTS);
-    // CT-Settings: ignore the page's select/filter/order; read Title+SettingValue and return only public rows.
-    if (a.list === 'CT-Settings') a = { list: a.list, select: ['Title', 'SettingValue'] };
+    if (a.list === 'CT-Settings') return settingsQuery(a);
     const q = [];
     if (Array.isArray(a.select) && a.select.length) q.push('$select=' + encodeURIComponent(a.select.join(',')));
     if (a.filter) q.push('$filter=' + encodeURIComponent(a.filter));
     if (a.orderby) q.push('$orderby=' + encodeURIComponent(a.orderby));
-    const want = Number.isInteger(a.top) && a.top > 0 ? a.top : 5000;
+    const want = Number.isInteger(a.top) && a.top > 0 ? a.top : Infinity;
     q.push('$top=' + Math.min(want, 5000));
-    let url = API + L(a.list) + '/items' + (q.length ? '?' + q.join('&') : '');
-    let items = [];
-    // Follow paging until we have what was asked for.
-    for (let page = 0; url && items.length < want && page < 50; page++) {
-      const body = parse(await req('GET', url, { headers: NOMETA }));
-      items = items.concat(body.value || []);
-      url = body['odata.nextLink'] || null;
-    }
-    items = items.slice(0, want);
-    if (a.list === 'CT-Settings') items = items.filter((it) => PUBLIC_SETTINGS.includes(it.Title)).map((it) => ({ Title: it.Title, SettingValue: it.SettingValue }));
-    return items;
+    return getItems(a.list, q, want);
   }
 
+  // Admin lists: only known columns, and only known setting rows.
+  function checkAdminWrite(a, creating) {
+    const keys = Object.keys(a.fields);
+    if (a.list === 'CT-Roles') {
+      const bad = keys.find((k) => !ROLE_COLUMNS.includes(k));
+      if (bad) throw new Error('Column not allowed on CT-Roles: ' + bad);
+    } else if (a.list === 'CT-Settings') {
+      const allowed = creating ? ['Title', 'SettingValue'] : ['SettingValue'];
+      const bad = keys.find((k) => !allowed.includes(k));
+      if (bad) throw new Error('Column not allowed on CT-Settings: ' + bad);
+      if (creating && !PUBLIC_SETTINGS.concat(SECRET_SETTINGS).includes(String(a.fields.Title))) {
+        throw new Error('Setting not allowed: ' + String(a.fields.Title));
+      }
+    }
+  }
   async function opSpCreate(a) {
-    checkList(a.list, WRITE_LISTS); checkFields(a.fields);
+    checkList(a.list, WRITE_LISTS.concat(ADMIN_LISTS)); checkFields(a.fields);
+    if (ADMIN_LISTS.includes(a.list)) checkAdminWrite(a, true);
+    if (a.list === 'CT-Settings') {
+      // One row per setting: a second row would never be read (lookups use the first match).
+      const t = String(a.fields.Title).replace(/'/g, "''");
+      const dup = parse(await req('GET', API + L('CT-Settings') + "/items?$select=Id&$filter=Title eq '" + t + "'", { headers: NOMETA })).value || [];
+      if (dup.length) throw new Error('Setting already exists: ' + String(a.fields.Title));
+    }
     const body = Object.assign({ __metadata: { type: await entityType(a.list) } }, a.fields);
     const r = await write(API + L(a.list) + '/items',
       { Accept: 'application/json;odata=nometadata', 'Content-Type': 'application/json;odata=verbose' }, JSON.stringify(body));
-    return parse(r);
+    const item = parse(r);
+    if (a.list === 'CT-Settings') delete item.SettingValue; // never echo a webhook back
+    return item;
   }
 
+  // ETags look like "3" or W/"3". Anything else is refused rather than sent as a header.
+  const ETAG_RE = /^(W\/)?"[\x21\x23-\x7e]{1,64}"$/;
   async function opSpUpdate(a) {
-    checkList(a.list, WRITE_LISTS); checkId(a.id); checkFields(a.fields);
+    checkList(a.list, WRITE_LISTS.concat(ADMIN_LISTS)); checkId(a.id); checkFields(a.fields);
+    if (ADMIN_LISTS.includes(a.list)) checkAdminWrite(a, false);
+    let ifMatch = '*';
+    if (a.etag !== undefined && a.etag !== null && a.etag !== '') {
+      if (typeof a.etag !== 'string' || !ETAG_RE.test(a.etag)) throw new Error('Invalid etag');
+      ifMatch = a.etag; // conditional write: SharePoint answers HTTP 412 if someone changed the item first
+    }
     const body = Object.assign({ __metadata: { type: await entityType(a.list) } }, a.fields);
     await write(API + L(a.list) + '/items(' + a.id + ')', {
       Accept: 'application/json;odata=nometadata', 'Content-Type': 'application/json;odata=verbose',
-      'X-HTTP-Method': 'MERGE', 'IF-MATCH': '*',
+      'X-HTTP-Method': 'MERGE', 'IF-MATCH': ifMatch,
     }, JSON.stringify(body));
     return {};
   }
@@ -162,20 +236,84 @@
     return {};
   }
 
-  let hookCache = null;
-  async function webhook() {
-    if (hookCache && Date.now() - hookCache.at < 5 * 60 * 1000) return hookCache.url;
-    const rows = parse(await req('GET', API + L('CT-Settings') + "/items?$select=Title,SettingValue&$filter=Title eq 'SlackWebhookUrl'", { headers: NOMETA })).value || [];
+  // ---------- recycle bin (0.5.0, Admin delete/restore) ----------
+  const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  async function opSpRecycle(a) {
+    checkList(a.list, WRITE_LISTS); checkId(a.id);
+    const r = await write(API + L(a.list) + '/items(' + a.id + ')/recycle()', { Accept: 'application/json;odata=nometadata' });
+    const body = parse(r);
+    const id = String(body.value || (body.d && body.d.Recycle) || '');
+    return { recycleId: id };
+  }
+  const listDirs = {};
+  async function listDir(list) {
+    if (!listDirs[list]) {
+      const u = parse(await req('GET', API + L(list) + '/RootFolder?$select=ServerRelativeUrl', { headers: NOMETA })).ServerRelativeUrl;
+      listDirs[list] = String(u || '').replace(/^\/+/, '').toLowerCase();
+    }
+    return listDirs[list];
+  }
+  async function opSpRecycleBin() {
+    const dirs = {};
+    for (const l of WRITE_LISTS) dirs[await listDir(l)] = l;
+    const sel = '$select=Id,Title,LeafName,DirName,DeletedByEmail,DeletedByName,DeletedDate';
+    const rows = parse(await req('GET', API + '/web/RecycleBin?' + sel, { headers: NOMETA })).value || [];
+    const out = [];
+    for (const r of rows) {
+      const list = dirs[String(r.DirName || '').replace(/^\/+/, '').toLowerCase()];
+      if (!list) continue; // only CT doubts, nothing else from the site's bin
+      out.push({
+        recycleId: String(r.Id || ''), title: String(r.Title || r.LeafName || ''), list,
+        deletedBy: String(r.DeletedByEmail || r.DeletedByName || '').replace(/@.*$/, '').toLowerCase(),
+        deletedAt: String(r.DeletedDate || ''),
+      });
+    }
+    out.sort((x, y) => (x.deletedAt < y.deletedAt ? 1 : x.deletedAt > y.deletedAt ? -1 : 0));
+    return out;
+  }
+  async function opSpRestore(a) {
+    const id = String(a.recycleId || '');
+    if (!GUID_RE.test(id)) throw new Error('Invalid recycle bin id');
+    // Only restore what opSpRecycleBin would list (a CT doubt), never other site content.
+    const bin = await opSpRecycleBin();
+    if (!bin.some((b) => b.recycleId.toLowerCase() === id.toLowerCase())) throw new Error('Not a CT doubt in the recycle bin');
+    await write(API + "/web/RecycleBin('" + id + "')/restore()", { Accept: 'application/json;odata=nometadata' });
+    return {};
+  }
+
+  // ---------- Slack (0.5.0: three webhooks) ----------
+  const hookCache = {};
+  async function webhook(kind, optional) {
+    const key = HOOK_KEYS[kind];
+    const c = hookCache[kind];
+    if (c && Date.now() - c.at < 5 * 60 * 1000) return c.url;
+    const rows = parse(await req('GET', API + L('CT-Settings') + "/items?$select=Title,SettingValue&$filter=Title eq '" + key + "'", { headers: NOMETA })).value || [];
     const url = rows.length ? String(rows[0].SettingValue || '').trim() : '';
-    if (!/^https:\/\/hooks\.slack\.com\//.test(url)) throw new Error('No valid SlackWebhookUrl in CT-Settings');
-    hookCache = { url, at: Date.now() };
+    if (!/^https:\/\/hooks\.slack\.com\/(services|triggers|workflows)\//.test(url)) {
+      if (optional) return '';
+      throw new Error('No valid ' + key + ' in CT-Settings');
+    }
+    hookCache[kind] = { url, at: Date.now() };
     return url;
   }
-  async function opSlack(a) {
+  // Channel posts (any / accepted) go to their own workflow. If that workflow is not set up yet, the message
+  // falls back to the direct-message workflow (the page always fills recipient/headline/details for it).
+  async function sendSlack(a) {
+    let kind = a.channel === 'any' || a.channel === 'accepted' ? a.channel : 'dm';
+    let url = kind === 'dm' ? await webhook('dm') : await webhook(kind, true);
+    if (!url) { kind = 'dm'; url = await webhook('dm'); }
     const payload = {};
-    for (const k of ['asker', 'recipient', 'headline', 'details', 'link']) payload[k] = String(a[k] == null ? '' : a[k]);
-    await req('POST', await webhook(), { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), label: 'Slack webhook' });
+    for (const k of SLACK_FIELDS[kind]) payload[k] = String(a[k] == null ? '' : a[k]);
+    try {
+      await req('POST', url, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), label: 'Slack webhook' });
+    } catch (e) {
+      delete hookCache[kind]; // a replaced webhook is picked up on the next send, not 5 minutes later
+      throw e;
+    }
     return {};
+  }
+  async function opSlack(a) {
+    return sendSlack(a);
   }
 
   function cleanupDrafts() {
@@ -200,7 +338,10 @@
     return v.draft;
   }
 
-  const OPS = { whoami: opWhoami, getDraft: opGetDraft, spQuery: opSpQuery, spCreate: opSpCreate, spUpdate: opSpUpdate, spDelete: opSpDelete, slack: opSlack };
+  const OPS = {
+    whoami: opWhoami, getDraft: opGetDraft, spQuery: opSpQuery, spCreate: opSpCreate, spUpdate: opSpUpdate, spDelete: opSpDelete,
+    slack: opSlack, spRecycle: opSpRecycle, spRecycleBin: opSpRecycleBin, spRestore: opSpRestore,
+  };
 
   function isBridgePage() {
     const here = location.origin + location.pathname;
@@ -289,7 +430,7 @@
     if (t.includes('Progress:') && /(^|\n)\s*Customer\s*\n\s*\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC/.test(t)) return 'Customer messages';
     return '';
   }
-  const currentTurn = () => +((bodyText().match(/Annotating customer query #(\d+)/) || [])[1] || 0);
+  const currentTurn = (t = bodyText()) => +((t.match(/Annotating customer query #(\d+)/) || [])[1] || 0);
   function accountFlags() {
     const m = bodyText().match(/ID:\s*[0-9a-f-]{36}\s*\n([\s\S]*?)\n\s*Progress:/i);
     return m ? m[1].split('\n').map((s) => s.trim()).filter(Boolean).join(', ') : '';
@@ -358,24 +499,146 @@
     }
     return turns;
   }
-  function fieldValue(label) {
-    const els = [...document.querySelectorAll('label,span,div')];
-    const l = els.find((e) => e.textContent.replace(/\*/g, '').trim() === label && e.textContent.length < label.length + 6);
-    if (!l) return '';
+  // The form block that holds one field's input (radio group, dropdown or text box), or null.
+  function fieldBox(label, els) {
+    const l = (els || [...document.querySelectorAll('label,span,div')])
+      .find((e) => e.textContent.replace(/\*/g, '').trim() === label && e.textContent.length < label.length + 6);
+    if (!l) return null;
     let c = l;
     for (let i = 0; i < 6 && c; i++) { c = c.parentElement; if (c && c.querySelector('input,textarea,button')) break; }
-    if (!c) return '';
+    return c || null;
+  }
+  function radioText(r) {
+    const lab = r.closest('label') || (r.parentElement && r.parentElement.parentElement);
+    return (lab && lab.textContent.trim()) || r.value || '';
+  }
+  // Cloudscape shows placeholder text in an empty dropdown; that is not an answer.
+  const PLACEHOLDER = /^(Select|Choose|No value|Pick)\b/i;
+  function boxValue(c) {
     const chk = c.querySelector('input[type=radio]:checked');
-    if (chk) {
-      const lab = chk.closest('label') || (chk.parentElement && chk.parentElement.parentElement);
-      return (lab && lab.textContent.trim()) || chk.value || '';
-    }
+    if (chk) return radioText(chk);
     const ta = c.querySelector('textarea');
     if (ta) return ta.value.trim();
     const b = c.querySelector('button');
     const v = b ? b.textContent.trim() : '';
-    // Cloudscape shows placeholder text in an empty dropdown; that is not an answer.
-    return /^(Select|Choose|No value|Pick)\b/i.test(v) ? '' : v;
+    return PLACEHOLDER.test(v) ? '' : v;
+  }
+  function fieldValue(label, els) {
+    const c = fieldBox(label, els);
+    return c ? boxValue(c) : '';
+  }
+
+  // ---------- per-turn values + field options (0.5.0) ----------
+  // abc-mlops shows one turn's form at a time. While the annotator works, the bridge remembers what each turn
+  // had marked (per conversation, 3 days), so Clarify can send every turn's values, not only the one on screen.
+  // It also remembers the choices each field offers (radio labels always; dropdown items when the list is
+  // open), so the site can offer the same values when an auditor disagrees.
+  const TURNVALS_PREFIX = 'ctc_turnvals:';
+  const TURNVALS_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+  const OPTS_KEY = 'ctc_fieldopts';
+  const MAX_OPTS = 200;
+  function optionText(o) {
+    const lab = o.querySelector('[class*="awsui_label"]');
+    return String(o.getAttribute('aria-label') || (lab || o).textContent || '').trim();
+  }
+  function boxOptions(c) {
+    const radios = [...c.querySelectorAll('input[type=radio]')];
+    if (radios.length) return radios.map(radioText);
+    const b = c.querySelector('[aria-expanded="true"]');
+    if (!b) return [];
+    const id = b.getAttribute('aria-controls') || b.getAttribute('aria-owns');
+    let host = id ? document.getElementById(id) : null;
+    if (!host) host = c.querySelector('[role=listbox]');
+    if (!host) {
+      const all = document.querySelectorAll('[role=listbox]');
+      if (all.length === 1) host = all[0];
+    }
+    return host ? [...host.querySelectorAll('[role=option]')].map(optionText) : [];
+  }
+  // label -> {value, options} for every field found on the page.
+  function readForm() {
+    const els = [...document.querySelectorAll('label,span,div')];
+    const out = {};
+    for (const f of FIELD_LABELS) {
+      const c = fieldBox(f, els);
+      if (c && c.querySelector('input,textarea,button')) out[f] = { value: boxValue(c), options: boxOptions(c) };
+    }
+    return out;
+  }
+  // Options are kept per marketplace (ctc_fieldopts:<MP>): DE values must not show up on an MX doubt.
+  function rememberOptions(form, mp) {
+    const key = mp ? OPTS_KEY + ':' + String(mp).toUpperCase() : '';
+    if (!key) return {};
+    const all = GM_getValue(key, null);
+    const opts = all && typeof all === 'object' ? all : {};
+    let changed = false;
+    for (const f of Object.keys(form)) {
+      const have = Array.isArray(opts[f]) ? opts[f] : [];
+      for (const v of form[f].options) {
+        if (!v || PLACEHOLDER.test(v) || have.includes(v) || have.length >= MAX_OPTS) continue;
+        have.push(v); changed = true;
+      }
+      opts[f] = have;
+    }
+    if (changed) GM_setValue(key, opts);
+    return opts;
+  }
+  function trackTurn() {
+    try {
+      const text = bodyText();
+      const conv = convId(text), turn = currentTurn(text);
+      if (!conv || !turn) return;
+      const form = readForm();
+      const labels = Object.keys(form);
+      if (!labels.length) return;
+      rememberOptions(form, marketplace(text));
+      const k = TURNVALS_PREFIX + conv;
+      const rec = GM_getValue(k, null);
+      const turns = rec && rec.turns && typeof rec.turns === 'object' ? rec.turns : {};
+      const old = turns[String(turn)] || {};
+      // A blank read never replaces a saved value: the page may clear the form for the next turn before the
+      // "query #N" header changes. The turn on screen is always read fresh at Clarify, so nothing is lost.
+      const row = Object.assign({}, old);
+      for (const f of labels) if (form[f].value !== '' || !(f in row)) row[f] = form[f].value;
+      if (rec && Date.now() - rec.at < 60 * 60 * 1000 && labels.every((f) => old[f] === row[f])) return;
+      turns[String(turn)] = row;
+      GM_setValue(k, { at: Date.now(), turns });
+    } catch (e) { /* best effort: Clarify still reads the turn on screen */ }
+  }
+  // Values change only when the annotator clicks, picks or types (moving to another turn is a click too), so
+  // read the form shortly after that, and once more a little later in case the next turn rendered slowly.
+  function watchForm(pill) {
+    let t1 = null, t2 = null;
+    const later = (e) => {
+      if (e && e.target && pill.contains(e.target)) return;
+      clearTimeout(t1); clearTimeout(t2);
+      t1 = setTimeout(trackTurn, 800);
+      t2 = setTimeout(trackTurn, 2500);
+    };
+    for (const ev of ['click', 'change', 'input', 'keyup']) document.addEventListener(ev, later, true);
+    later();
+  }
+  function cleanupTurnVals() {
+    try {
+      for (const k of GM_listValues()) {
+        if (!String(k).startsWith(TURNVALS_PREFIX)) continue;
+        const v = GM_getValue(k, null);
+        if (!v || typeof v.at !== 'number' || Date.now() - v.at > TURNVALS_TTL_MS) GM_deleteValue(k);
+      }
+    } catch (e) { /* storage not listable */ }
+  }
+  // Every turn's values for Clarify: remembered turns plus the turn on screen (always read fresh).
+  function valuesByTurn(conv, cur, curValues, turnCount) {
+    const out = {};
+    const rec = conv ? GM_getValue(TURNVALS_PREFIX + conv, null) : null;
+    if (rec && rec.turns && typeof rec.turns === 'object') {
+      for (const t of Object.keys(rec.turns)) {
+        const n = +t, v = rec.turns[t];
+        if (Number.isInteger(n) && n >= 1 && n <= turnCount && v && typeof v === 'object') out[String(n)] = Object.assign({}, v);
+      }
+    }
+    out[String(cur)] = Object.assign({}, curValues);
+    return out;
   }
 
   function newKey() {
@@ -387,10 +650,16 @@
     const turns = buildTurns();
     if (!turns.length) { alert('CT Clarifications: could not read the conversation on this page.'); return; }
     const text = bodyText();
+    const conv = convId(text);
+    const cur = currentTurn(text) || 1;
+    const els = [...document.querySelectorAll('label,span,div')];
+    const fieldValues = Object.fromEntries(FIELD_LABELS.map((f) => [f, fieldValue(f, els)]));
+    let fieldOptions = {};
+    try { fieldOptions = rememberOptions(readForm(), marketplace(text)); } catch (e) { /* options are optional */ }
     const draft = {
-      sourceTool: 'abc-mlops', conversationId: convId(text), marketplace: marketplace(text), accountFlags: accountFlags(),
-      currentTurn: currentTurn() || 1, annotatorAlias: myAlias(),
-      fieldValues: Object.fromEntries(FIELD_LABELS.map((f) => [f, fieldValue(f)])), turns,
+      sourceTool: 'abc-mlops', conversationId: conv, marketplace: marketplace(text), accountFlags: accountFlags(),
+      currentTurn: cur, annotatorAlias: myAlias(), fieldValues, turns,
+      fieldValuesByTurn: valuesByTurn(conv, cur, fieldValues, turns.length), fieldOptions, bridgeVersion: SCRIPT_VERSION,
     };
     console.info('CT bridge: Clarify captured ' + turns.length + ' turn(s), MP ' + (draft.marketplace || '(not found)') +
       ', conversation ' + (draft.conversationId || '(no ID found)'));
@@ -428,6 +697,126 @@
     const st = document.createElement('style');
     st.textContent = css;
     document.head.appendChild(st);
+  }
+
+  // ---------- reminders (0.5.0) ----------
+  // Same rules as the site (domain/reminders.ts), so doubts still get reminded when no CT tab is open: an
+  // any-auditor doubt nobody took gets a channel reminder every ReminderIntervalMin minutes, up to
+  // ReminderMaxCount times, then one DM to the first active Admin. Each reminder is claimed first with a
+  // conditional write (If-Match), so only one tab, site or abc-mlops, ever sends it.
+  const REMIND_EVERY_MS = 5 * 60 * 1000;
+  const REMIND_FIRST_MS = 20 * 1000;
+  const REMIND_LOCK = 'ctc_remind_last';
+  const sv = (v) => (v == null ? '' : String(v));
+  function numSetting(v, dflt, min, max) {
+    const n = sv(v).trim() === '' ? NaN : Number(v);
+    return Number.isFinite(n) && n >= min && n <= max ? n : dflt;
+  }
+  function dueReminder(d, set, now) {
+    const st = sv(d.Status);
+    if (st !== 'Open' && st !== 'Reopened') return null;
+    if (sv(d.AssignedTo).trim().toLowerCase() !== 'any' || sv(d.TakenBy).trim() !== '') return null;
+    let base = NaN;
+    for (const k of ['LastReminderAt', 'Created']) {
+      base = typeof d[k] === 'string' ? Date.parse(d[k]) : NaN;
+      if (Number.isFinite(base)) break;
+    }
+    if (!Number.isFinite(base) || now - base < set.intervalMin * 60e3) return null;
+    const n = Number(d.ReminderCount);
+    const sent = Number.isFinite(n) ? n : 0;
+    if (sent < set.maxCount) return { kind: 'remind', count: sent + 1, max: set.maxCount };
+    if (sent === set.maxCount) return { kind: 'remindAdmin', count: sent };
+    return null;
+  }
+  function threadWith(raw, entry) {
+    let arr = [];
+    try { const v = JSON.parse(sv(raw)); if (Array.isArray(v)) arr = v; } catch (e) { /* unreadable Thread: start a new one, as the site does */ }
+    const out = arr.filter((e) => e && typeof e === 'object' && typeof e.type === 'string')
+      .map((e) => ({ type: e.type, by: e.by, at: e.at, text: e.text }));
+    out.push(entry);
+    return JSON.stringify(out);
+  }
+  // Slack message for one reminder (same wording as the site's notifier), or null when nobody can be named.
+  // Same labels and order as the site's field table (columns.ts FIELD_MAP).
+  const TOPIC_LABELS = [['ToolInvoked', 'Tool Invoked Accurate'], ['HVACategory', 'HVA Category'],
+    ['InteractionType', 'Interaction Type'], ['StaticResponseType', 'Static Response Type'],
+    ['CSRouting', 'Customer Service Routing'], ['ResponseContent', 'Response Content Accurate'],
+    ['NegFeedback', 'Negative Customer Feedback Classification'], ['ExpectedResponse', 'Expected Response'],
+    ['Observations', 'Observations'], ['General', 'General / other']];
+  const splitList = (v) => sv(v).split(';').map((x) => x.trim()).filter((x) => x !== '');
+  function doubtLabel(d) {
+    const want = new Set(splitList(d.Topics));
+    const multi = TOPIC_LABELS.filter(([t]) => want.has(t));
+    if (multi.length > 1) return multi.map(([, l]) => l).join(', ');
+    const one = multi.length === 1 ? multi[0][0] : sv(d.Topic);
+    const hit = TOPIC_LABELS.find(([t]) => t === one);
+    return hit ? hit[1] : one;
+  }
+  function doubtTurnText(d) {
+    const turns = [...new Set(splitList(d.Turns).map(Number).filter((n) => Number.isInteger(n)))].sort((a, b) => a - b);
+    return turns.length > 1 ? 'Turns ' + turns.join(', ') : 'Turn ' + sv(d.QueryNumber);
+  }
+  function reminderPayload(d, due, roles) {
+    const active = roles.filter((r) => r.Active === true && sv(r.SlackMemberId).trim() !== '');
+    const admin = active.find((r) => r.Role === 'Admin');
+    if (!admin) return null; // same rule as the site: without an Admin nothing is claimed or sent
+    const askerA = sv(d.AskedBy).trim().toLowerCase();
+    const m = askerA ? active.find((r) => sv(r.Title).trim().toLowerCase() === askerA) : null;
+    const asker = m ? m.SlackMemberId : admin ? admin.SlackMemberId : '';
+    if (!asker) return null;
+    const suffix = m ? '' : ' (for ' + askerA + ')';
+    const link = CT_SITE_URL + '#/doubt/' + sv(d.DoubtId);
+    const details = sv(d.ConversationId) + ' · ' + doubtTurnText(d) + ' of ' + sv(d.TurnCount) + ' · ' + sv(d.Marketplace) + ' · ' + doubtLabel(d);
+    if (due.kind === 'remind') {
+      // Channel post; recipient/headline/details are only used if the channel workflow is not set up (DM fallback).
+      return { channel: 'any', asker, link, details,
+        message: 'asked a doubt that is still waiting. Any available auditor can take it. (Reminder ' + due.count + ' of ' + due.max + ')',
+        recipient: admin.SlackMemberId,
+        headline: askerA + "'s doubt is still waiting for an auditor (reminder " + due.count + ' of ' + due.max + ').' + suffix };
+    }
+    return { asker, recipient: admin.SlackMemberId, link, details,
+      headline: 'No auditor took ' + askerA + "'s doubt after " + due.count + ' reminders.' + suffix };
+  }
+  // One pass. Returns the number of reminders sent. Several abc-mlops tabs share one pass per 5 minutes.
+  async function remindPass(now = Date.now()) {
+    const last = Number(GM_getValue(REMIND_LOCK, 0)) || 0;
+    if (now - last < REMIND_EVERY_MS - 30 * 1000) return 0;
+    GM_setValue(REMIND_LOCK, now);
+    const set = {};
+    for (const r of await settingsQuery({ filter: "Title eq 'ReminderIntervalMin' or Title eq 'ReminderMaxCount'" })) set[r.Title] = r.SettingValue;
+    const rules = { intervalMin: numSetting(set.ReminderIntervalMin, 30, 5, 24 * 60), maxCount: Math.floor(numSetting(set.ReminderMaxCount, 3, 0, 20)) };
+    if (rules.maxCount <= 0) return 0;
+    const items = await getItems('CT-Open', ['$filter=' + encodeURIComponent("AssignedTo eq 'ANY'"), '$top=5000'], Infinity);
+    const due = items.map((d) => [d, dueReminder(d, rules, now)]).filter((x) => x[1]);
+    if (!due.length) return 0;
+    const roles = await getItems('CT-Roles', ['$select=Id,Title,Role,SlackMemberId,Active', '$top=5000'], Infinity);
+    let sent = 0;
+    for (const [d, r] of due) {
+      try {
+        const p = reminderPayload(d, r, roles);
+        // Without an ETag the claim is not safe (two tabs could both send), so skip.
+        if (!p || !d.__etag) continue;
+        const at = new Date(now).toISOString();
+        const text = r.kind === 'remind' ? 'Reminder ' + r.count + ' of ' + r.max + ' sent to #ct-clarifications' : 'No one took it: Admin pinged';
+        try {
+          await opSpUpdate({ list: 'CT-Open', id: d.Id, etag: d.__etag, fields: {
+            ReminderCount: r.kind === 'remind' ? r.count : r.count + 1, LastReminderAt: at,
+            Thread: threadWith(d.Thread, { type: 'remind', by: 'ct-ask', at, text }) } });
+        } catch (e) {
+          if (/HTTP 412|precondition/i.test(e.message)) continue; // another tab claimed it first
+          throw e;
+        }
+        await sendSlack(p);
+        sent += 1;
+      } catch (e) { console.warn('CT bridge: reminder for doubt ' + sv(d.DoubtId) + ' failed: ' + (e && e.message)); }
+    }
+    return sent;
+  }
+  function startReminders() {
+    const run = () => remindPass()
+      .then((n) => { if (n) console.info('CT bridge: sent ' + n + ' reminder(s)'); })
+      .catch((e) => console.warn('CT bridge: reminder pass skipped: ' + (e && e.message)));
+    setTimeout(() => { run(); setInterval(run, REMIND_EVERY_MS); }, REMIND_FIRST_MS);
   }
 
   function startCapture() {
@@ -519,6 +908,9 @@
     console.info('CT bridge ' + SCRIPT_VERSION + ': Clarify capture started on ' + location.pathname);
     check();
     setInterval(check, 1500);
+    cleanupTurnVals();
+    watchForm(w);
+    startReminders();
   }
 
   // ---------- entry ----------
